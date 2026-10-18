@@ -38,10 +38,22 @@ pub struct HttpTransport {
 
 impl HttpTransport {
     pub fn new(timeout_secs: u64) -> Result<Self, String> {
+        Self::build(timeout_secs, false)
+    }
+
+    /// Account reads must never replay a supplied cookie to a redirect target.
+    pub fn without_redirects(timeout_secs: u64) -> Result<Self, String> {
+        Self::build(timeout_secs, true)
+    }
+
+    fn build(timeout_secs: u64, no_redirects: bool) -> Result<Self, String> {
         ensure_crypto_provider();
         let tls = build_tls_config()?;
-        let client = reqwest::Client::builder()
-            .tls_backend_preconfigured(tls)
+        let mut builder = reqwest::Client::builder().tls_backend_preconfigured(tls);
+        if no_redirects {
+            builder = builder.redirect(reqwest::redirect::Policy::none());
+        }
+        let client = builder
             .build()
             .map_err(|e| format!("build http client: {e}"))?;
         Ok(HttpTransport {
@@ -57,6 +69,48 @@ impl HttpTransport {
         headers: &[(String, String)],
         body: Option<Vec<u8>>,
         timeout: Option<Duration>,
+    ) -> Result<RawResponse, TransportError> {
+        self.request_inner(method, url, headers, body, timeout, None)
+            .await
+    }
+
+    /// Account responses are bounded before accumulating their body in memory.
+    pub async fn request_bounded(
+        &self,
+        method: &str,
+        url: &str,
+        headers: &[(String, String)],
+        max_bytes: usize,
+    ) -> Result<RawResponse, TransportError> {
+        self.request_inner(method, url, headers, None, None, Some(max_bytes))
+            .await
+    }
+
+    /// Read-only account RPCs also use JSON POST; bound both directions and
+    /// sign the same body bytes that are transmitted by this method.
+    pub async fn request_body_bounded(
+        &self,
+        method: &str,
+        url: &str,
+        headers: &[(String, String)],
+        body: Vec<u8>,
+        max_bytes: usize,
+    ) -> Result<RawResponse, TransportError> {
+        if body.len() > 16 * 1024 {
+            return Err(TransportError::Network("request exceeds size limit".into()));
+        }
+        self.request_inner(method, url, headers, Some(body), None, Some(max_bytes))
+            .await
+    }
+
+    async fn request_inner(
+        &self,
+        method: &str,
+        url: &str,
+        headers: &[(String, String)],
+        body: Option<Vec<u8>>,
+        timeout: Option<Duration>,
+        max_bytes: Option<usize>,
     ) -> Result<RawResponse, TransportError> {
         let m = reqwest::Method::from_bytes(method.as_bytes())
             .map_err(|e| TransportError::Network(format!("bad method {method}: {e}")))?;
@@ -80,7 +134,7 @@ impl HttpTransport {
             builder = builder.body(b);
         }
 
-        let resp = builder
+        let mut resp = builder
             .send()
             .await
             .map_err(|e| TransportError::Network(e.to_string()))?;
@@ -95,18 +149,47 @@ impl HttpTransport {
                 )
             })
             .collect();
-        let mut body = resp
-            .bytes()
-            .await
-            .map_err(|e| TransportError::Network(e.to_string()))?
-            .to_vec();
+        let mut body = if let Some(limit) = max_bytes {
+            let mut bytes = Vec::new();
+            while let Some(chunk) = resp
+                .chunk()
+                .await
+                .map_err(|e| TransportError::Network(e.to_string()))?
+            {
+                if bytes.len().saturating_add(chunk.len()) > limit {
+                    return Err(TransportError::Network(
+                        "response exceeds size limit".into(),
+                    ));
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            bytes
+        } else {
+            resp.bytes()
+                .await
+                .map_err(|e| TransportError::Network(e.to_string()))?
+                .to_vec()
+        };
 
         let gzip_header = headers.iter().any(|(k, v)| {
             k.eq_ignore_ascii_case("content-encoding") && v.eq_ignore_ascii_case("gzip")
         });
         let gzip_magic = body.len() >= 2 && body[0] == 0x1f && body[1] == 0x8b;
         if gzip_header || gzip_magic {
-            if let Some(inflated) = gunzip(&body) {
+            if let Some(limit) = max_bytes {
+                use std::io::Read;
+                let mut inflated = Vec::new();
+                flate2::read::GzDecoder::new(body.as_slice())
+                    .take(limit as u64 + 1)
+                    .read_to_end(&mut inflated)
+                    .map_err(|_| TransportError::Network("invalid compressed response".into()))?;
+                if inflated.len() > limit {
+                    return Err(TransportError::Network(
+                        "response exceeds size limit".into(),
+                    ));
+                }
+                body = inflated;
+            } else if let Some(inflated) = gunzip(&body) {
                 body = inflated;
             }
         }
