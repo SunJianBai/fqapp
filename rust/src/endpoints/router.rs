@@ -47,7 +47,6 @@ pub fn match_rest_path(path: &str, query: &Params) -> Option<RouteMatch> {
             api: "forum_id",
             params: query.clone(),
         }),
-        "viewer" => match_viewer(query),
         _ => None,
     }
 }
@@ -375,6 +374,12 @@ fn match_series(parts: &[&str], q: &Params) -> Option<RouteMatch> {
     }
     let mut p = q.clone();
     p.set("series_id", parts[0]);
+    if parts.len() == 2 && parts[1] == "related" {
+        return Some(RouteMatch {
+            api: "series_related",
+            params: p,
+        });
+    }
     // 短剧剧评（`gx1/m.java:168-181`）与短剧分享
     // （`m0.java:938-957`，`share_type=7`）。
     if parts.len() >= 2 {
@@ -521,22 +526,6 @@ fn match_comments(parts: &[&str], q: &Params) -> Option<RouteMatch> {
         }),
         _ => None,
     }
-}
-
-fn match_viewer(q: &Params) -> Option<RouteMatch> {
-    let plugin = q.get_str("plugin");
-    if plugin.is_empty() {
-        return None;
-    }
-    let api: &'static str = match plugin.as_str() {
-        "player" => "player",
-        "manga_reader" => "manga_reader",
-        _ => return None,
-    };
-    Some(RouteMatch {
-        api,
-        params: q.clone(),
-    })
 }
 
 /// Router-level device pinning helper (see `device_session.go`).

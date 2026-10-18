@@ -149,51 +149,101 @@ void main() {
       expect(page, greaterThanOrEqualTo(0));
     });
 
-    testWidgets('the end page replaces the plain 下一章 placeholder', (
-      tester,
-    ) async {
-      // The end page shows while the boundary request (next chapter) is in
-      // flight; hold it open so the widget is observable.
-      final boundary = Completer<void>();
-      ReaderPagedViewState? state;
-      await tester.pumpWidget(
-        MaterialApp(
-          home: Scaffold(
-            body: ReaderPagedView(
-              layout: _layout(),
-              pageIndex: 0,
-              hasPreviousChapter: false,
-              hasNextChapter: true,
-              onPageChanged: (_) {},
-              onBoundary: (direction) => boundary.future,
-              onDragStart: () {},
-              turnStyle: ReaderPageTurnStyle.none,
-              backgroundColor: Colors.white,
-              endPage: const Scaffold(
-                body: Center(
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [Text('本章完'), Text('下一章')],
+    testWidgets(
+      'a chapter boundary requests once without showing an end page',
+      (tester) async {
+        final boundary = Completer<void>();
+        final layout = _layout();
+        var requests = 0;
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              body: ReaderPagedView(
+                layout: layout,
+                pageIndex: layout.pages.length - 1,
+                hasPreviousChapter: false,
+                hasNextChapter: true,
+                onPageChanged: (_) {},
+                onBoundary: (direction) {
+                  expect(direction, 1);
+                  requests++;
+                  return boundary.future;
+                },
+                onDragStart: () {},
+                turnStyle: ReaderPageTurnStyle.none,
+                backgroundColor: Colors.white,
+                endPage: const Scaffold(
+                  body: Center(
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [Text('本章完'), Text('下一章')],
+                    ),
                   ),
                 ),
               ),
             ),
           ),
+        );
+        for (var i = 0; i < 4; i++) {
+          await tester.pump(const Duration(milliseconds: 32));
+        }
+        final state = tester.state<ReaderPagedViewState>(
+          find.byType(ReaderPagedView),
+        );
+        unawaited(state.turnPage(1));
+        // No animation/timer is needed to request the chapter.
+        expect(requests, 1);
+        unawaited(state.turnPage(1));
+        await tester.pump(const Duration(seconds: 2));
+        expect(requests, 1);
+        expect(find.text('本章完'), findsNothing);
+        expect(find.text('下一章'), findsNothing);
+        boundary.complete();
+        await tester.pump(const Duration(milliseconds: 32));
+        await tester.pumpWidget(const SizedBox.shrink());
+      },
+    );
+
+    testWidgets('the final chapter still has a stable completion page', (
+      tester,
+    ) async {
+      final layout = _layout();
+      var requests = 0;
+      var completions = 0;
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: ReaderPagedView(
+              layout: layout,
+              pageIndex: layout.pages.length - 1,
+              hasPreviousChapter: true,
+              hasNextChapter: false,
+              onPageChanged: (_) {},
+              onBoundary: (_) async {
+                requests++;
+              },
+              onDragStart: () {},
+              turnStyle: ReaderPageTurnStyle.none,
+              backgroundColor: Colors.white,
+              endPage: const Center(child: Text('本章完')),
+              onBookEnd: () => completions++,
+            ),
+          ),
         ),
       );
-      for (var i = 0; i < 4; i++) {
-        await tester.pump(const Duration(milliseconds: 32));
-      }
-      state = tester.state<ReaderPagedViewState>(find.byType(ReaderPagedView));
-      // Walk forward until the trailing boundary item shows the end page.
-      for (var i = 0; i < 30 && find.text('本章完').evaluate().isEmpty; i++) {
-        unawaited(state.turnPage(1));
-        await tester.pump(const Duration(milliseconds: 300));
-      }
+      final state = tester.state<ReaderPagedViewState>(
+        find.byType(ReaderPagedView),
+      );
+      unawaited(state.turnPage(1));
+      await tester.pumpAndSettle();
       expect(find.text('本章完'), findsOneWidget);
-      expect(find.text('下一章'), findsOneWidget);
-      boundary.complete();
-      await tester.pump(const Duration(milliseconds: 32));
+      expect(state.isAtEndPage, isTrue);
+      expect(completions, 1);
+      await state.turnPage(1);
+      await tester.pump(const Duration(seconds: 2));
+      expect(requests, 0);
+      expect(state.isAtEndPage, isTrue);
+      await tester.pumpWidget(const SizedBox.shrink());
     });
   });
 
@@ -202,6 +252,7 @@ void main() {
       SharedPreferences.setMockInitialValues({
         'reader_page_mode': 'paged',
         'reader_volume_key_turn': true,
+        'reader_info_mode': 'detailed',
       });
       await tester.binding.setSurfaceSize(const Size(400, 800));
       addTearDown(() => tester.binding.setSurfaceSize(null));
@@ -231,10 +282,25 @@ void main() {
               .data ??
           '';
       expect(pageNumber(), contains('本章 1 /'));
-      await tester.sendKeyEvent(LogicalKeyboardKey.audioVolumeDown);
+      // 音量键已由 HardwareKeyboard 改为原生 MethodChannel 回调
+      // （fqapp/volume-key），测试里没有原生端，改用平台通道模拟原生回调。
+      Future<void> sendVolumeKey(int direction) async {
+        await TestDefaultBinaryMessengerBinding
+            .instance
+            .defaultBinaryMessenger
+            .handlePlatformMessage(
+              'fqapp/volume-key',
+              const StandardMethodCodec().encodeMethodCall(
+                MethodCall('volumeKey', direction),
+              ),
+              (_) {},
+            );
+      }
+
+      await sendVolumeKey(1);
       await tester.pumpAndSettle();
       expect(pageNumber(), contains('本章 2 /'));
-      await tester.sendKeyEvent(LogicalKeyboardKey.audioVolumeUp);
+      await sendVolumeKey(-1);
       await tester.pumpAndSettle();
       expect(pageNumber(), contains('本章 1 /'));
     });
@@ -245,6 +311,7 @@ void main() {
       SharedPreferences.setMockInitialValues({
         'reader_page_mode': 'paged',
         'reader_auto_turn_seconds': 3,
+        'reader_info_mode': 'detailed',
       });
       await tester.binding.setSurfaceSize(const Size(400, 800));
       addTearDown(() => tester.binding.setSurfaceSize(null));

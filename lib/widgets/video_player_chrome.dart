@@ -112,6 +112,7 @@ class VideoPlayerChrome extends StatefulWidget {
   /// 标题行「剧名 >」点击 → 官方进剧集详情页（`series_detail`，ql3/v0
   /// `a1()` 的默认分支）。null 时不响应（非短剧形态）。
   final VoidCallback? onOpenSeriesDetail;
+  final VoidCallback? onOpenRelatedSeries;
   final String seriesCover;
   final String episodeLabel;
 
@@ -192,6 +193,7 @@ class VideoPlayerChrome extends StatefulWidget {
     this.onHotCommentTap,
     this.seriesTitle = '',
     this.onOpenSeriesDetail,
+    this.onOpenRelatedSeries,
     this.seriesCover = '',
     this.episodeLabel = '',
     this.relateBook,
@@ -508,6 +510,9 @@ class _VideoPlayerChromeState extends State<VideoPlayerChrome>
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
+    // `inactive` 只是瞬态打断（下拉通知栏/控制中心/分屏呼出）：应用仍在
+    // 前台可见，播放继续；只有 hidden/paused/detached 才表示真正离场。
+    if (state == AppLifecycleState.inactive) return;
     final active = state == AppLifecycleState.resumed;
     if (!active && _appActive) {
       _appActive = false;
@@ -845,6 +850,9 @@ class _VideoPlayerChromeState extends State<VideoPlayerChrome>
   }
 
   void _seekBy(int seconds) {
+    // 未就绪时不发 seek：播放器尚未 create，native seek 会丢，
+    // 但 onSeeked/_pendingSeek 先写了就会污染后续的相对 seek。
+    if (!_ready) return;
     final base = _pendingSeek ?? _position.value;
     final milliseconds = (base.inMilliseconds + seconds * 1000).clamp(
       0,
@@ -856,6 +864,9 @@ class _VideoPlayerChromeState extends State<VideoPlayerChrome>
     _pendingSeek = target;
     // ±10s 的目标在点击时就已确定，直接上报；连续快进按累计目标取数。
     widget.onSeeked?.call(target);
+    // 控制条隐藏时侧边 seek 没有任何视觉反馈：先亮起控制条
+    // （进度条随位置更新），再按原计时收起。
+    if (mounted) setState(() => _visible = true);
     unawaited(
       _control((player) async {
         try {
@@ -1234,6 +1245,11 @@ class _VideoPlayerChromeState extends State<VideoPlayerChrome>
       ],
     ),
   );
+
+  Future<void> _openRelatedSeries() async {
+    await _closePanel();
+    if (mounted) widget.onOpenRelatedSeries?.call();
+  }
 
   void _openPanel() {
     if (_locked || _overlayOpen || _panelOpen) return;
@@ -1634,21 +1650,23 @@ class _VideoPlayerChromeState extends State<VideoPlayerChrome>
                   } else if (!widget.shortSeries) {
                     _togglePlayback();
                   } else {
-                    // 官方短剧双击从不切换播放（jq3/x$q.onDoubleTap
-                    // :2155-2188）：中带（y ∈ 44dp..屏高-240dp）触发
-                    // x.X6()->o.x7()->fullscreen/c 的横屏控制条隐藏。
+                    // 短剧横屏双击：中间三分之一切播放，左/右三分之一 ±10s。
+                    // 官方 jq3/x$q.onDoubleTap 只在中带隐藏控制条、从不切
+                    // 播放；实测反馈要求双击能暂停/快进快退，这里按通用
+                    // 播放器手势处理（竖屏分支保持原样：吞单击窗口）。
                     _guardDoubleTap();
                     final position = _doubleTapDownPosition;
-                    final height = window.height;
-                    if (landscape &&
-                        !_clearScreen &&
-                        _visible &&
-                        position != null &&
-                        height > 0 &&
-                        position.dy > 44 &&
-                        position.dy < height - 240) {
-                      _hideTimer?.cancel();
-                      setState(() => _visible = false);
+                    final width = window.width;
+                    if (_clearScreen || position == null || width <= 0) return;
+                    final third = width / 3;
+                    if (position.dx < third) {
+                      if (!_ready) return;
+                      if (widget.duration > Duration.zero) _seekBy(-10);
+                    } else if (position.dx > width - third) {
+                      if (!_ready) return;
+                      if (widget.duration > Duration.zero) _seekBy(10);
+                    } else {
+                      _togglePlayback();
                     }
                   }
                 },
@@ -1982,6 +2000,9 @@ class _VideoPlayerChromeState extends State<VideoPlayerChrome>
                       child: Opacity(opacity: t, child: child!),
                     ),
                     child: StoryEpisodeDrawer(
+                      onOpenRelatedSeries: widget.onOpenRelatedSeries == null
+                          ? null
+                          : _openRelatedSeries,
                       episodes: widget.episodes,
                       currentIndex: widget.currentIndex,
                       playingIndex:
@@ -2038,6 +2059,9 @@ class _VideoPlayerChromeState extends State<VideoPlayerChrome>
                         snapSizes: _panelSnapSizes,
                         shouldCloseOnMinExtent: false,
                         builder: (context, scroll) => StoryPlayerPanel(
+                          onOpenRelatedSeries: widget.onOpenRelatedSeries == null
+                              ? null
+                              : _openRelatedSeries,
                           seriesTitle: widget.seriesTitle,
                           seriesCover: widget.seriesCover,
                           episodeLabel: widget.episodeLabel,

@@ -11,9 +11,9 @@ use fqapi_core::endpoints::dhcontent::set_dh_content_in_place;
 use fqapi_core::endpoints::{router, session, Params, INTERNAL_DEVICE_PIN_KEY};
 use fqapi_core::sign::Manager;
 use fqapi_core::upstream::{UpstreamClient, UpstreamRequest};
-use num_bigint::BigUint;
 use serde_json::{json, Value};
 use std::sync::Arc;
+use zeroize::Zeroizing;
 
 async fn server_with(dir: &TempDir, origin: &str) -> Arc<fqapi_core::endpoints::Server> {
     build_server(dir, Some(origin.to_string()), &[], &[], &pool_json(5)).await
@@ -233,6 +233,44 @@ async fn exact_media_ids_and_params_reach_the_upstream() {
     upstream.shutdown();
 }
 
+#[tokio::test]
+async fn related_series_uses_only_the_official_same_series_scene() {
+    let fixture: Value = serde_json::from_str(include_str!("../testdata/series_related.json"))
+        .expect("series related fixture");
+    let expected = fixture["response"].clone();
+    let reply = expected.clone();
+    let upstream = MockUpstream::start(move |_| MockReply::json(reply.clone())).await;
+    let dir = TempDir::new("related-series");
+    let server = server_with(&dir, &upstream.origin).await;
+    let id = fixture["series_id"].as_str().unwrap();
+    let (status, body) = json_body(
+        dispatch(
+            &server,
+            &api_get(
+                &format!("/api/v1/series/{id}/related"),
+                "scene=1&from=other&book_id=wrong&filter_ids=wrong",
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(body, expected);
+    let request = upstream.last_request().expect("request");
+    assert_eq!(
+        request.method,
+        fixture["request"]["method"].as_str().unwrap()
+    );
+    assert_eq!(request.path, fixture["request"]["path"].as_str().unwrap());
+    let query = query_map(&request.query);
+    for (key, value) in fixture["request"]["query"].as_object().unwrap() {
+        assert_eq!(query.get(key).map(String::as_str), value.as_str(), "{key}");
+    }
+    assert!(request.body.is_empty());
+    assert!(request.header("x-argus").is_some());
+    upstream.shutdown();
+}
+
 // --- V1.1: a session is pinned to the device that opened it -----------------
 
 #[tokio::test]
@@ -308,7 +346,7 @@ fn dh_content_decrypts_a_go_generated_fixture() {
     let cipher = f["cipher_b64"].as_str().expect("cipher_b64");
 
     let state = fqapi_core::upstream::dh::DHState {
-        a: BigUint::from(1u32),
+        a: Zeroizing::new(vec![1]),
     };
 
     let raw = serde_json::to_vec(&json!({
@@ -338,7 +376,7 @@ fn dh_content_failure_modes_fail_closed() {
     let f = &fixture["dh_content"];
     let key = f["key_b64"].as_str().unwrap();
     let state = fqapi_core::upstream::dh::DHState {
-        a: BigUint::from(1u32),
+        a: Zeroizing::new(vec![1]),
     };
 
     // Encrypted response without a usable key or ciphertext.

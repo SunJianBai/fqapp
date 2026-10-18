@@ -541,6 +541,10 @@ class _AudioPlaybackController extends ChangeNotifier
         () => ApiClient.instance
             .audioSource(itemId, bookId: _bookId, toneId: toneId)
             .timeout(const Duration(seconds: 30)),
+        // A deterministic "this tone does not exist" answer will not change on
+        // retry: let it reach the fallback below immediately.
+        shouldRetry: (error) =>
+            error is! ApiException || !error.message.contains('NO_THIS_TONE'),
       );
     } on ApiException catch (error) {
       if (toneId != '0' ||
@@ -1218,7 +1222,13 @@ class _AudioPlaybackController extends ChangeNotifier
     final saved = _persistProgress().catchError((Object _) {});
     final released = _releasePlayer();
     notifyListeners();
-    await Future.wait([NativePlayer.stopListenForeground(), saved, released]);
+    // The foreground-service stop is best-effort: every other call site
+    // fire-and-forgets it, and awaiting the platform reply here would block
+    // session teardown forever if the platform never answers (engine
+    // shutdown, or a widget test with no channel mock), which in turn
+    // stalls the acquire queue waiting on close().
+    unawaited(NativePlayer.stopListenForeground());
+    await Future.wait([saved, released]);
     // Views/sheets may still be detaching during close; their listenables
     // remain readable until they release this controller for collection.
   }

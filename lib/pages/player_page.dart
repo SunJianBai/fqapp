@@ -7,6 +7,8 @@ import '../models/audio_extra.dart' show RelatedWork;
 import '../models/media_item.dart';
 import '../models/playlet_comment.dart';
 import '../models/series_detail.dart';
+import '../models/related_series.dart';
+import '../widgets/player/related_series_sheet.dart';
 import 'detail_page.dart' show openBookDetail;
 import 'series_detail_page.dart' show SeriesDetailPage;
 import '../services/api_client.dart';
@@ -134,6 +136,7 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
   /// 0 表示「还没有人评论」，入口按官方文案显示「评论」。
   int _commentCount = 0;
   bool _externalPanelOpen = false;
+  bool _switchingSeries = false;
 
   /// 选集面板头部用的剧信息（官方 `aa8.xml:7-15`）。
   String _seriesTitle = '';
@@ -304,7 +307,7 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
   /// 官方右栏评论入口：竖屏走底部评论面板（`CommentDialogHelper`）。
   /// 面板数据走短剧剧评链路（`gx1/m.java:168-181`），与播放页共用剧集 id。
   Future<void> _withPlayerOverlay(Future<void> Function() open) async {
-    if (_externalPanelOpen || !mounted) return;
+    if (_externalPanelOpen || _switchingSeries || !mounted) return;
     setState(() => _externalPanelOpen = true);
     try {
       await open();
@@ -313,39 +316,127 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
     }
   }
 
+  /// Pause the player while a route pushed from this page is on top, and
+  /// resume on return if the page still shows the same episode with the
+  /// same player.
+  ///
+  /// In-app pushes do not change AppLifecycleState, so without this the
+  /// video keeps playing behind DetailPage / ReaderPage / AudioPage
+  /// (#39). Callers that drive their own load from the pushed route
+  /// (detail's onPlayEpisode / onOpenRelatedSeries) update [_index] /
+  /// [_switchingSeries] / [_player] synchronously on pop, so the guards
+  /// below see their effect before resuming and the resume never fights
+  /// their load. A pause failure must not block the navigation.
+  Future<void> _pauseWhileRouteOnTop(Future<void> Function() push) async {
+    final player = _player;
+    final wasPlaying = _playing;
+    final indexBefore = _index;
+    if (player != null && wasPlaying) {
+      try {
+        await player.pause();
+      } catch (_) {
+        // Best-effort: the route still opens; a failed pause only means
+        // the video may keep playing behind it.
+      }
+    }
+    if (!mounted) return;
+    await push();
+    if (!mounted || !wasPlaying) return;
+    if (!identical(_player, player)) return;
+    if (_index != indexBefore || _switchingSeries) return;
+    await player?.play();
+  }
+
   /// 标题行「剧名 >」→ 剧集详情页（官方 `ql3/v0.a1()` 默认分支：
   /// `openShortSeriesDetailActivity`，页面名 `series_detail`）。
   ///
-  /// 官方进详情时播放器**继续活着**（返回即续看），这里同样不销毁；
+  /// 详情页在上时暂停播放，返回后按原状态续看；从详情再往深走（关联
+  /// 原著 → 阅读/听书）时视频也不会在下面一直播（#39）。
   /// 详情页点「继续播放/选集」只是关掉详情并切集，不叠第二个播放器。
   void _openSeriesDetail() {
     if (!widget.shortSeries || widget.bookId.isEmpty) return;
     unawaited(
       _withPlayerOverlay(
-        () => Navigator.push(
-          context,
-          MaterialPageRoute<void>(
-            builder: (_) => SeriesDetailPage(
-              seriesId: widget.bookId,
-              title: _seriesTitle,
-              cover: _seriesCover,
-              episodes: widget.eps,
-              startIndex: _index,
-              watchedIds: _watchedIds,
-              initialDetail: _seriesDetail,
-              historyStore: widget.historyStore,
-              hasPlaybackProgress: (_player?.position.inMilliseconds ?? 0) > 0,
-              seriesLoader: widget.seriesLoader,
-              onPlayEpisode: (index) {
-                // 详情页就在本播放器之上，pop 一次即回到播放页。
-                Navigator.of(context).pop();
-                if (index != _index) _selectEpisode(index);
-              },
+        () => _pauseWhileRouteOnTop(
+          () => Navigator.push(
+            context,
+            MaterialPageRoute<void>(
+              builder: (_) => SeriesDetailPage(
+                seriesId: widget.bookId,
+                kind: widget.kind,
+                title: _seriesTitle,
+                cover: _seriesCover,
+                episodes: widget.eps,
+                startIndex: _index,
+                watchedIds: _watchedIds,
+                initialDetail: _seriesDetail,
+                historyStore: widget.historyStore,
+                hasPlaybackProgress: (_player?.position.inMilliseconds ?? 0) > 0,
+                seriesLoader: widget.seriesLoader,
+                onOpenRelatedSeries: (entry) {
+                  Navigator.of(context).pop();
+                  unawaited(_switchRelatedSeries(entry));
+                },
+                onPlayEpisode: (index) {
+                  // 详情页就在本播放器之上，pop 一次即回到播放页。
+                  Navigator.of(context).pop();
+                  if (index != _index) _selectEpisode(index);
+                },
+              ),
             ),
           ),
         ),
       ),
     );
+  }
+
+  Future<void> _openRelatedSeries() => _withPlayerOverlay(() async {
+    final entry = await RelatedSeriesSheet.show(context, widget.bookId);
+    if (entry != null && mounted) await _switchRelatedSeries(entry);
+  });
+
+  Future<void> _switchRelatedSeries(RelatedSeries entry) async {
+    if (!mounted ||
+        _switchingSeries ||
+        entry.unavailable ||
+        entry.id == widget.bookId) {
+      return;
+    }
+    setState(() => _switchingSeries = true);
+    final wasPlaying = _playing || _initVideo;
+    // Persist before detaching; no old decoder or late autoplay may survive
+    // into the next series. Keep the route alive: replacing it would complete
+    // the feed's awaited push early and restart its inline player underneath.
+    ++_loadGeneration;
+    _pendingAutoplay = null;
+    _prefetchTimer?.cancel();
+    _progressTimer?.cancel();
+    _watchTime.stop();
+    _loadTrace?.finish('relatedSeries');
+    try {
+      // Capture progress synchronously, then release even if storage is slow.
+      final saved = _persistProgress();
+      await _teardownPlayer();
+      await saved;
+      if (!mounted) return;
+      await Navigator.of(context).push<void>(
+        MaterialPageRoute<void>(
+          builder: (_) => SeriesDetailPage(
+            seriesId: entry.id,
+            kind: entry.kind,
+            title: entry.title,
+            cover: entry.cover,
+            historyStore: widget.historyStore,
+            seriesLoader: widget.seriesLoader,
+          ),
+        ),
+      );
+    } finally {
+      if (mounted) {
+        setState(() => _switchingSeries = false);
+        await _loadVideo(autoplay: wasPlaying);
+      }
+    }
   }
 
   void _openComments() {
@@ -586,19 +677,26 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
   }
 
   /// 原著书卡点击 → 原著详情页（audio 页同一条 MediaItem 跳转链路）。
+  ///
+  /// 进详情前暂停，返回后按原状态续看；否则视频会在书详情乃至从详情
+  /// 再进的阅读/听书下面一直播（#39）。
   void _openOriginalBook() {
     final book = _originalBook;
     if (book == null) return;
-    openBookDetail(
-      context,
-      MediaItem(
-        id: book.id,
-        title: book.title,
-        cover: book.cover,
-        author: '',
-        badge: book.label,
-        ep: '',
-        kind: 'book',
+    unawaited(
+      _pauseWhileRouteOnTop(
+        () => openBookDetail(
+          context,
+          MediaItem(
+            id: book.id,
+            title: book.title,
+            cover: book.cover,
+            author: '',
+            badge: book.label,
+            ep: '',
+            kind: 'book',
+          ),
+        ),
       ),
     );
   }
@@ -710,6 +808,7 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
 
   bool _canPrefetch(int generation, NativePlayer player) =>
       _current(generation, player) &&
+      !_switchingSeries &&
       _appActive &&
       !_paging &&
       !_initVideo &&
@@ -810,8 +909,8 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
     return _releases;
   }
 
-  Future<void> _loadVideo({bool refresh = false}) async {
-    if (widget.eps.isEmpty) return;
+  Future<void> _loadVideo({bool refresh = false, bool autoplay = true}) async {
+    if (!mounted || _switchingSeries || widget.eps.isEmpty) return;
     _loadTrace?.finish('superseded');
     final generation = ++_loadGeneration;
     final index = _index;
@@ -862,8 +961,8 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
         if (chosen != null) online = online.withVariant(chosen);
         source = online;
       }
-      _currentSource = source;
       if (!_current(generation)) return;
+      _currentSource = source;
       final sourceUri = Uri.tryParse(source.url);
       final isRemote =
           sourceUri != null &&
@@ -968,7 +1067,7 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
       });
       trace.stage('autoplayWait');
       _onFirstFrame(player, generation);
-      _pendingAutoplay = player;
+      _pendingAutoplay = autoplay ? player : null;
       await _tryAutoplay(generation);
       if (!_current(generation, player)) return;
       _onFirstFrame(player, generation);
@@ -1112,6 +1211,9 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
       player.videoSizeStream.listen((_) {
         if (_current(generation, player)) setState(() {});
       }),
+      player.textureIdStream.listen((_) {
+        if (_current(generation, player)) setState(() {});
+      }),
       player.firstFrameStream.listen((_) {
         if (!_current(generation, player)) return;
         _onFirstFrame(player, generation);
@@ -1154,6 +1256,7 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
     final state = WidgetsBinding.instance.lifecycleState;
     final active = state == null || state == AppLifecycleState.resumed;
     if (active &&
+        !_switchingSeries &&
         _hasDisplayed &&
         _playing &&
         !(_player?.buffering ?? true) &&
@@ -1216,6 +1319,7 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
 
   Future<void> _selectEpisode(int index, {int? expectedGeneration}) {
     if (!mounted ||
+        _switchingSeries ||
         index < 0 ||
         index >= widget.eps.length ||
         index == _index ||
@@ -1248,7 +1352,7 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
       playing: _playing,
       shortSeries: widget.shortSeries,
       watchedEpisodes: watchedIndexes(_watchedIds, widget.eps),
-      interactionBlocked: _externalPanelOpen,
+      interactionBlocked: _externalPanelOpen || _switchingSeries,
       aiGenerated: widget.aiGenerated,
       showSeekHint: _seekHintVisible,
       onSeekHintConsumed: _consumeSeekHint,
@@ -1277,6 +1381,10 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
       // 官方播放页标题行「剧名 >」（ql3/v0 `a1()`）与选集面板头部箭头
       // 都进剧集详情页（`series_detail`）。
       onOpenSeriesDetail: widget.shortSeries ? _openSeriesDetail : null,
+      onOpenRelatedSeries:
+          widget.shortSeries && (_seriesDetail?.hasRelatedSeries ?? false)
+          ? () => unawaited(_openRelatedSeries())
+          : null,
       seriesCover: _seriesCover,
       episodeLabel: _episodeLabel,
       fillScreen: _fillScreen,

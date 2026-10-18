@@ -1,10 +1,54 @@
-# fqapp — 番茄小说/短剧/漫剧/听书/漫画聚合客户端
+<p align="center">
+  <img src="assets/images/app_logo.webp" width="120" height="120" alt="fqapp Logo">
+</p>
 
-fqapp 是一个运行在 **Android 手机本地** 的番茄内容聚合客户端：小说阅读、短剧与漫剧播放、听书、漫画、搜索、历史和离线缓存在同一个 App 里完成。核心（签名、解密、缓存）都在手机上运行，不需要自建服务器，也不需要 root。
+<h1 align="center">fqapp</h1>
 
-> ⚠️ **免责声明**：本项目仅供学习与研究交流，不内置、不分发任何内容资源；在线内容均来自番茄公开接口，版权归字节跳动及原权利方所有。本项目与番茄/字节跳动无关联，未获其授权；使用产生的一切后果由使用者自行承担，如有侵权请联系删除。
+<p align="center">
+  <strong>内容聚合客户端</strong><br>
+  小说 · 短剧 · 漫剧 · 漫画 · 听书，签名 / 解密 / 缓存全部在手机本地完成
+</p>
 
-## 功能一览
+<p align="center">
+  <a href="#-功能一览">功能一览</a> ·
+  <a href="#-下载与安装">下载与安装</a> ·
+  <a href="#-快速上手">快速上手</a> ·
+  <a href="#-常见问题">常见问题</a> ·
+  <a href="#-支持作者">支持作者</a> ·
+  <a href="DEVELOPMENT.md">开发者文档</a>
+</p>
+
+<p align="center">
+  <a href="https://github.com/ch6vip/fqapp/releases/latest">
+    <img alt="Release" src="https://img.shields.io/github/v/release/ch6vip/fqapp?color=EF5038&label=Release&logo=github">
+  </a>
+  &nbsp;
+  <a href="https://github.com/ch6vip/fqapp/releases">
+    <img alt="Downloads" src="https://img.shields.io/github/downloads/ch6vip/fqapp/total?color=14B8A6&label=Downloads&logo=github">
+  </a>
+  &nbsp;
+  <img alt="Platform" src="https://img.shields.io/badge/Platform-Android%207.0%2B%20%C2%B7%20arm64--v8a-3DDC84?logo=android&logoColor=white">
+  &nbsp;
+  <a href="LICENSE">
+    <img alt="License" src="https://img.shields.io/badge/License-GPL--3.0-blue">
+  </a>
+  &nbsp;
+  <a href="https://github.com/ch6vip/fqapp/stargazers">
+    <img alt="Stars" src="https://img.shields.io/github/stars/ch6vip/fqapp?style=social">
+  </a>
+</p>
+
+<p align="center">
+  <a href="https://github.com/ch6vip/fqapp/releases/latest">
+    <img alt="下载 APK" height="44" src="https://img.shields.io/badge/%E4%B8%8B%E8%BD%BD-APK-3DDC84?style=for-the-badge&logo=android&logoColor=white">
+  </a>
+</p>
+
+> ⚠️ **免责声明**：本项目仅供学习与研究交流，不内置、不分发任何内容资源；在线内容均来自第三方公开接口，版权归原权利方所有。本项目与内容提供方无关联，未获其授权；使用产生的一切后果由使用者自行承担，如有侵权请联系删除。
+
+---
+
+## 📖 功能一览
 
 | 功能 | 说明 |
 |---|---|
@@ -18,12 +62,12 @@ fqapp 是一个运行在 **Android 手机本地** 的番茄内容聚合客户端
 | 🕘 历史与书架 | 阅读/播放进度自动记录，续读续看；离线缓存管理 |
 | ⬇️ 下载 | 整本缓存、批量缓存后续章节，下载内容不受自动清理影响 |
 
-## 下载与安装
+## ⬇️ 下载与安装
 
 ### 设备要求
 
 - Android 7.0（API 24）及以上，**arm64-v8a** 设备（绝大多数近几年的手机）。
-- 需要网络：在线内容实时从番茄上游获取，App 本身不内置任何内容。
+- 需要网络：在线内容实时从上游获取，App 本身不内置任何内容。
 - 不需要 root。
 
 ### 获取安装包
@@ -49,7 +93,7 @@ fqapp 是一个运行在 **Android 手机本地** 的番茄内容聚合客户端
 
 > ⚠️ **签名与升级**：正式签名与调试签名的包**不能互相覆盖安装**。Releases 与 Actions 产出的 release 包使用正式签名；从旧签名版本（v1.0.17 及更早）升级需要**先卸载**再安装，卸载会同时清除阅读历史与缓存。同签名版本可直接覆盖升级。
 
-## 快速上手
+## 🚀 快速上手
 
 ### 找内容
 
@@ -58,7 +102,8 @@ fqapp 是一个运行在 **Android 手机本地** 的番茄内容聚合客户端
 
 ### 读小说
 
-- 左右分页与上下滚动两种翻页方式；正文两端对齐、首行缩进，页眉页脚显示书名、进度、时间和电量。
+- 左右分页与上下滚动两种翻页方式；正文两端对齐、首行缩进。阅读信息默认简洁（底部时间与全书进度），排版设置中可切换详细信息或关闭。
+- 分页翻过本章最后一页直接进入下一章正文，反向翻页进入上一章末页；有评论数据时，可从阅读菜单查看本章评论。
 - 排版面板实时调整字号、字重、字距、行距、段距、边距与阅读背景（四种主题），设置自动保存。
 - 支持导入自定义字体（TTF/OTF/TTC，单文件不超过 32 MB）。
 - 亮度可手动调节或跟随系统，只影响阅读界面，退出或切后台自动恢复。
@@ -71,6 +116,7 @@ fqapp 是一个运行在 **Android 手机本地** 的番茄内容聚合客户端
 - 0.75–2 倍速可保存；长按画面临时 2 倍速。
 - 全屏方向按视频比例自适应（横屏剧集横屏、竖屏剧集竖屏），也可锁定方向。
 - 播放进度自动记录，随时续看。
+- 有关联数据的作品在选集和详情页提供「同系列」入口，可切换到其他季的详情与选集；未上线作品标记为暂不可播放。
 
 ### 听书
 
@@ -93,7 +139,7 @@ fqapp 是一个运行在 **Android 手机本地** 的番茄内容聚合客户端
 - 书架页右上角「离线缓存」可直接打开已缓存书籍，不依赖网络。
 - 设置 → 数据 → 章节缓存：查看占用、删除单本或清空全部。
 
-## 常见问题
+## ❓ 常见问题
 
 **Q：启动时一直停在初始化 / 健康检查失败？**
 首次启动需要联网完成设备注册，请检查网络后重试；运行状态可在「我的 → 服务状态」查看。
@@ -118,17 +164,39 @@ fqapp 是一个运行在 **Android 手机本地** 的番茄内容聚合客户端
 **Q：有 iOS 版吗？**
 没有。当前仅支持 Android（arm64）。
 
-## 许可与免责声明
+## 💖 支持作者
 
-本项目代码以 [GPL-3.0](LICENSE) 协议开源，Copyright (C) 2026 ch6vip。
+如果这个项目对你有帮助，欢迎在爱发电支持我；也欢迎给项目点一个 ⭐ Star。
 
-本项目仅供学习与研究交流，不内置、不分发任何内容资源；在线内容均来自番茄公开接口，版权归字节跳动及原权利方所有。本项目与番茄/字节跳动无关联，未获其授权；使用产生的一切后果由使用者自行承担，如有侵权请联系删除。请遵守相关法律法规，仅限个人学习研究使用。
+[![Afdian](https://img.shields.io/badge/Afdian-Sponsor-946ce6?style=social&logo=afdian)](https://afdian.com/a/ch6vip)
 
-## 致谢（Acknowledgments）
+微信赞助：
+
+<img src=".github/wechat.png" width="260" alt="微信赞助">
+
+应用内的同一入口在「设置 → 关于 → 支持作者」。
+
+## 🙏 致谢
 
 Thanks to the [LINUX DO](https://linux.do/) community for its support and feedback.
 
 感谢 [LINUX DO](https://linux.do/) 社区的支持与反馈。
+
+## 📄 许可与免责声明
+
+本项目代码以 [GPL-3.0](LICENSE) 协议开源，Copyright (C) 2026 ch6vip。
+
+本项目仅供学习与研究交流，不内置、不分发任何内容资源；在线内容均来自第三方公开接口，版权归原权利方所有。本项目与内容提供方无关联，未获其授权；使用产生的一切后果由使用者自行承担，如有侵权请联系删除。请遵守相关法律法规，仅限个人学习研究使用。
+
+## ⭐ Star History
+
+<a href="https://www.star-history.com/?repos=ch6vip%2Ffqapp&type=date&legend=top-left">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=ch6vip/fqapp&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=ch6vip/fqapp&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=ch6vip/fqapp&type=date&legend=top-left" />
+ </picture>
+</a>
 
 ---
 

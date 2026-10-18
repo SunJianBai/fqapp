@@ -4,7 +4,7 @@ import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:flutter_lucide/flutter_lucide.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import 'package:hive_flutter/hive_flutter.dart';
+import 'package:hive_ce_flutter/hive_flutter.dart';
 
 import 'dart:async';
 import 'dart:ui' show ImageFilter;
@@ -159,7 +159,7 @@ class _FqAppState extends State<FqApp> {
                 navigatorKey: _navigatorKey,
                 child: child ?? const SizedBox.shrink(),
               ),
-              title: '番茄小铺',
+              title: 'fqapp',
               debugShowCheckedModeBanner: false,
               theme: _theme(Brightness.light, eink: eink),
               darkTheme: _theme(Brightness.dark, eink: eink),

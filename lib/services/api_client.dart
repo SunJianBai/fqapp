@@ -19,6 +19,7 @@ import '../models/media_item.dart';
 import '../models/media_id.dart';
 import '../models/playlet_comment.dart';
 import '../models/rank.dart';
+import '../models/related_series.dart';
 import '../models/search_discovery.dart';
 import '../models/series_detail.dart';
 import 'app_log.dart';
@@ -1138,6 +1139,20 @@ class ApiClient {
     }
   }
 
+  Future<List<RelatedSeries>> relatedSeries(String seriesId) async {
+    final response = await _get(
+      _url('/api/v1/series/${Uri.encodeComponent(seriesId)}/related', {}),
+    );
+    final status = response.statusCode;
+    final bytes = response.bodyBytes;
+    return Isolate.run(
+      () => RelatedSeries.fromPayload(
+        _decodeEnvelope(status, bytes),
+        currentSeriesId: seriesId,
+      ),
+    );
+  }
+
   /// Returns comic pages in backend order with absolute HTTP(S) URLs.
   Future<List<ComicImage>> comicImages(String itemId) async {
     final response = await _get(
@@ -1489,9 +1504,17 @@ Map<String, dynamic> _decodeEnvelope(int statusCode, List<int> bodyBytes) {
   final payload = Map<String, dynamic>.from(decoded);
   // The web bridge uses code=200; REST upstream-compatible endpoints use
   // code=0. Both are successful envelopes.
+  //
+  // The "unavailable" codes are exempted rather than thrown: they mean "this
+  // item has no subtitles / no paragraph comments", which the subtitle and
+  // chapter-idea callers answer with an empty result. Throwing here made their
+  // `isUnavailableCode`/`isUnavailableIdeaCode` guards unreachable dead code -
+  // they only ever saw the exception path.
   if (payload['code'] != null &&
       payload['code'] != 200 &&
-      payload['code'] != 0) {
+      payload['code'] != 0 &&
+      !isUnavailableCode(payload['code']) &&
+      !isUnavailableIdeaCode(payload['code'])) {
     throw ApiException(
       '${payload['message'] ?? '请求失败'}',
       upstreamCode: payload['code'] is int ? payload['code'] as int : null,

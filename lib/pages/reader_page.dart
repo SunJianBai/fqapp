@@ -15,8 +15,11 @@ import '../services/chapter_text_formatter.dart';
 import '../services/library_store.dart';
 import '../services/listening_session.dart';
 import '../services/reader_device.dart';
+import '../services/eink_refresh.dart';
+import '../services/volume_key.dart';
 import '../services/reader_history.dart';
 import '../services/reader_preferences.dart';
+import '../services/reader_tap_zones.dart';
 import '../services/reader_underline_store.dart';
 import '../services/system_tts.dart';
 import '../widgets/chapter_cache_sheet.dart';
@@ -24,6 +27,7 @@ import '../widgets/reader/reader_appearance_sheet.dart';
 import '../widgets/reader/reader_bubble.dart';
 import '../widgets/reader/reader_chapter_layout.dart';
 import '../widgets/reader/reader_controls.dart';
+import '../widgets/reader/reader_cutout_insets.dart';
 import '../widgets/reader/reader_illustration.dart';
 import '../widgets/reader/reader_ideas_sheet.dart';
 import '../widgets/reader/reader_paged_view.dart';
@@ -102,8 +106,9 @@ class _ReaderPageState extends State<ReaderPage> with WidgetsBindingObserver {
   final ScrollController _scrollController = ScrollController();
   Timer? _saveTimer;
 
-  /// 滚动模式下底部拖过边界的累计量：超过阈值才触发连续阅读进下一章，
-  /// 避免轻微回弹误触（与分页视图的 32px 边界阈值一致）。
+  /// 滚动模式下拖过边界的累计量：超过阈值才触发连续阅读跨章，避免轻微
+  /// 回弹误触（与分页视图的 32px 边界阈值一致）。带符号：拖过底部为正，
+  /// 拖过顶部为负；同一拖拽内反向会抵消累计量。
   double _scrollOverscroll = 0;
 
   /// In-flight chapter fetch. Switching chapters or leaving the reader cancels
@@ -135,30 +140,43 @@ class _ReaderPageState extends State<ReaderPage> with WidgetsBindingObserver {
       ? ReaderThemePreset.eink
       : _preferences.themePreset;
 
-  bool _handleVolumeKey(KeyEvent event) {
+  /// 排版用的偏好：墨水屏模式下把预设换成 eink，正文/标题才是 #000000。
+  ///
+  /// 页面背景早就走 [_effectivePreset]，但 [ReaderLayoutSpec] 的正文、标题
+  /// 颜色和 [ReaderControls] 自己的读色都取自这里传入的 preferences。之前
+  /// 两处直接传 [_preferences]，于是全局墨水屏开启后正文仍用用户保存预设的
+  /// textColor（默认米白 #292724）——实测设备上正文主色 RGB(41,39,36)，
+  /// 墨水屏把它量化成明显发灰的一档。保存的预设不动，关闭墨水屏即恢复。
+  ReaderPreferences get _displayPreferences => einkModeNotifier.value
+      ? _preferences.copyWith(themePreset: ReaderThemePreset.eink)
+      : _preferences;
+
+  /// 原生层（MainActivity.dispatchKeyEvent）拦截到音量键后回调：仅在阅读页
+  /// 当前路由、未显示控制栏、已开启音量键翻页、且为分页模式时翻页。
+  void _onVolumeKey(int direction) {
     if (!mounted ||
-        !_appActive ||
-        ModalRoute.of(context)?.isCurrent != true ||
+        !_routeCurrent ||
+        _controlsVisible ||
         !_preferences.volumeKeyTurn ||
-        _controlsVisible) {
-      return false;
+        !_paged) {
+      return;
     }
-    if (event is! KeyDownEvent && event is! KeyRepeatEvent) return false;
-    if (_paged) {
-      if (event.logicalKey == LogicalKeyboardKey.audioVolumeDown) {
-        _pauseListenFollow();
-        _stopAutoTurn();
-        unawaited(_turnPage(1));
-        return true;
-      }
-      if (event.logicalKey == LogicalKeyboardKey.audioVolumeUp) {
-        _pauseListenFollow();
-        _stopAutoTurn();
-        unawaited(_turnPage(-1));
-        return true;
-      }
-    }
-    return false;
+    _pauseListenFollow();
+    _stopAutoTurn();
+    unawaited(_turnPage(direction));
+  }
+
+  /// 根据当前状态同步原生是否拦截音量键：仅当阅读页是当前路由、未显示控制栏、
+  /// 已开启音量键翻页、且为分页模式时启用。其余情况放行系统音量。
+  void _syncVolumeKeyEnabled() {
+    unawaited(
+      VolumeKeyService.instance.setEnabled(
+        _routeCurrent &&
+            _preferences.volumeKeyTurn &&
+            !_controlsVisible &&
+            _paged,
+      ),
+    );
   }
 
   void _toggleAutoTurn() {
@@ -192,7 +210,33 @@ class _ReaderPageState extends State<ReaderPage> with WidgetsBindingObserver {
     _listenFollowPausedUntil = DateTime.now().add(const Duration(seconds: 15));
   }
 
+  /// 朗读句高亮：与跟随翻页独立同步，跟随关闭时高亮仍可显示；暂停、
+  /// 切章或未在读本章时清空。
+  (int, int)? _narrationRange;
+
+  void _syncNarrationHighlight() {
+    if (!mounted) return;
+    final layout = _chapterLayout;
+    (int, int)? next;
+    final session = ListeningSession.instance;
+    if (_preferences.narrationHighlight &&
+        layout != null &&
+        session.matches(widget.bookId, _chapter.itemId)) {
+      final ttsRange = session.sentenceRange;
+      if (ttsRange != null) {
+        final translated = narrationLayoutRange(layout, ttsRange);
+        if (translated != null) {
+          next = (translated.start, translated.end);
+        }
+      }
+    }
+    if (next != _narrationRange) {
+      setState(() => _narrationRange = next);
+    }
+  }
+
   void _onListeningTick() {
+    _syncNarrationHighlight();
     if (!mounted ||
         !_routeCurrent ||
         !_appActive ||
@@ -251,11 +295,23 @@ class _ReaderPageState extends State<ReaderPage> with WidgetsBindingObserver {
   bool _routeCurrent = false;
   bool _changingChapter = false;
 
+  /// 墨水屏整屏刷新计数器：每翻一页 +1，达到 [_ReaderState._einkRefreshInterval]
+  /// 阈值（来自 [_preferences.einkRefreshInterval]）就调用一次海信 EPD 全刷压残影，
+  /// 然后归零。仅在全局墨水屏模式开启时累加。
+  int _einkPageCounter = 0;
+
+  /// Chapter-boundary transition handed to [ReaderPagedView]; see
+  /// [ReaderChapterTurn]. Set by [_next] / [_prev] and cleared once the slide
+  /// finishes, or when the chapter fails to load.
+  // Note: .agents/notes/implemented/bug-fix/2026-10-15-reader-chapter-turn-animation.md
+  ReaderChapterTurn? _chapterTurnRequest;
+
   /// Height of the reader's own bottom toolbar (目录/夜间/听书/设置) as measured
   /// on device, including its safe-area inset. The paragraph action bar keeps
   /// clear of it so a long press near the page foot flips above the line
   /// instead of landing on top of the controls.
   static const _bottomBarHeight = 74.0;
+
   /// Set while 从本段听 is waiting on a timeline fetch, so a repeated long-press
   /// cannot stack a second listening page (and a second player) on top.
   bool _openingListening = false;
@@ -352,7 +408,8 @@ class _ReaderPageState extends State<ReaderPage> with WidgetsBindingObserver {
   @override
   void initState() {
     super.initState();
-    HardwareKeyboard.instance.addHandler(_handleVolumeKey);
+    VolumeKeyService.instance.setOnVolumeKey(_onVolumeKey);
+    _syncVolumeKeyEnabled();
     ListeningSession.instance.addListener(_onListeningTick);
     WidgetsBinding.instance.addObserver(this);
     _appActive =
@@ -381,6 +438,7 @@ class _ReaderPageState extends State<ReaderPage> with WidgetsBindingObserver {
     if (_routeCurrent == current) return;
     _routeCurrent = current;
     _syncSystemBars();
+    _syncVolumeKeyEnabled();
   }
 
   // Note: Route/lifecycle ownership and SDK 36 compatibility; see
@@ -408,6 +466,7 @@ class _ReaderPageState extends State<ReaderPage> with WidgetsBindingObserver {
         _dayTheme = preferences.themePreset;
       }
     });
+    _syncVolumeKeyEnabled();
     await _loadFont(preferences.fontPath);
     if (mounted && _appActive) unawaited(_refreshDevice());
   }
@@ -912,7 +971,8 @@ class _ReaderPageState extends State<ReaderPage> with WidgetsBindingObserver {
   @override
   void dispose() {
     _chapterRequest?.cancel();
-    HardwareKeyboard.instance.removeHandler(_handleVolumeKey);
+    VolumeKeyService.instance.setOnVolumeKey(null);
+    unawaited(VolumeKeyService.instance.setEnabled(false));
     ListeningSession.instance.removeListener(_onListeningTick);
     _autoTurnTimer?.cancel();
     WidgetsBinding.instance.removeObserver(this);
@@ -954,9 +1014,15 @@ class _ReaderPageState extends State<ReaderPage> with WidgetsBindingObserver {
         }
       }
     }
+    // 前台/后台切换不影响原生层音量键拦截（在 Activity 层，与 Flutter 生命周期
+    // 无关），故此处无需重挂监听；仅同步一次状态即可。
+    _syncVolumeKeyEnabled();
   }
 
-  Future<void> _load({bool startAtEnd = false}) async {
+  Future<void> _load({
+    bool startAtEnd = false,
+    ReaderChapterTurn? chapterTurn,
+  }) async {
     if (widget.chapters.isEmpty) return;
     final generation = ++_loadGeneration;
     final chapter = _chapter;
@@ -974,6 +1040,7 @@ class _ReaderPageState extends State<ReaderPage> with WidgetsBindingObserver {
       _needsRestore = true;
       _requestedStartAtEnd = startAtEnd;
       _sessionActive = false;
+      _chapterTurnRequest = chapterTurn;
     });
     if (_scrollController.hasClients) _scrollController.jumpTo(0);
 
@@ -1019,6 +1086,7 @@ class _ReaderPageState extends State<ReaderPage> with WidgetsBindingObserver {
       setState(() {
         _error = '$e';
         _loading = false;
+        _chapterTurnRequest = null;
       });
     }
   }
@@ -1389,7 +1457,7 @@ class _ReaderPageState extends State<ReaderPage> with WidgetsBindingObserver {
     final spec = ReaderLayoutSpec(
       viewport: constraints.biggest,
       textScaler: MediaQuery.textScalerOf(context),
-      preferences: _preferences,
+      preferences: _displayPreferences,
       fontFamily:
           _fontFamily ?? Theme.of(context).textTheme.bodyLarge?.fontFamily,
     );
@@ -1517,6 +1585,21 @@ class _ReaderPageState extends State<ReaderPage> with WidgetsBindingObserver {
     });
     _settleReadTime();
     unawaited(_persistProgress());
+    // 分页模式的实际翻页：累加墨水屏刷新计数（覆盖音量键/自动翻页/点按翻页）。
+    _recordEinkPageTurn();
+  }
+
+  /// 墨水屏整屏刷新：翻够 [_preferences.einkRefreshInterval] 页触发一次海信 EPD
+  /// 全刷压残影。全局墨水屏未开或间隔为 0 时直接跳过，计数不累加。
+  void _recordEinkPageTurn() {
+    if (!einkModeNotifier.value) return;
+    final interval = _preferences.einkRefreshInterval;
+    if (interval <= 0) return;
+    _einkPageCounter++;
+    if (_einkPageCounter >= interval) {
+      _einkPageCounter = 0;
+      unawaited(EinkRefreshService.instance.refreshIfSupported());
+    }
   }
 
   Future<void> _pageBoundary(int direction) async {
@@ -1530,6 +1613,28 @@ class _ReaderPageState extends State<ReaderPage> with WidgetsBindingObserver {
     } else {
       await _next();
     }
+  }
+
+  /// Captures the page on screen so a chapter boundary can animate. Returns
+  /// null when paging is off or the reader is set to turn without animation.
+  ReaderChapterTurn? _captureChapterTurn(int direction) {
+    if (!_paged || _preferences.pageTurnStyle == ReaderPageTurnStyle.none) {
+      return null;
+    }
+    final layout = _chapterLayout;
+    if (layout == null || layout.pages.isEmpty) return null;
+    return ReaderChapterTurn(
+      direction: direction,
+      page: layout.pages[_pageIndex.clamp(0, layout.pages.length - 1)],
+      spec: layout.spec,
+    );
+  }
+
+  /// The boundary slide finished: drop the overlay so the rebuilt pagination
+  /// shows through. The chapter switch itself was already committed.
+  void _onChapterTurnCompleted() {
+    if (!mounted || _chapterTurnRequest == null) return;
+    setState(() => _chapterTurnRequest = null);
   }
 
   Future<void> _persistProgress({bool createHistory = false}) async {
@@ -1593,8 +1698,9 @@ class _ReaderPageState extends State<ReaderPage> with WidgetsBindingObserver {
       _settleReadTime();
       await _persistProgress();
       if (!mounted) return;
+      final turn = _captureChapterTurn(-1);
       setState(() => _index--);
-      await _load(startAtEnd: startAtEnd);
+      await _load(startAtEnd: startAtEnd, chapterTurn: turn);
     } finally {
       _changingChapter = false;
     }
@@ -1611,8 +1717,9 @@ class _ReaderPageState extends State<ReaderPage> with WidgetsBindingObserver {
       _settleReadTime();
       await _persistProgress();
       if (!mounted) return;
+      final turn = _captureChapterTurn(1);
       setState(() => _index++);
-      await _load();
+      await _load(chapterTurn: turn);
     } finally {
       _changingChapter = false;
     }
@@ -1660,6 +1767,8 @@ class _ReaderPageState extends State<ReaderPage> with WidgetsBindingObserver {
       await _pagedKey.currentState?.turnPage(direction);
       return;
     }
+    // 滚动模式的离散翻页（音量键/点按边缘/自动翻页）记一次，连续拖拽不计入。
+    _recordEinkPageTurn();
     if (!_scrollController.hasClients) return;
     final position = _scrollController.position;
     const boundaryTolerance = 2.0;
@@ -1692,16 +1801,50 @@ class _ReaderPageState extends State<ReaderPage> with WidgetsBindingObserver {
       ScaffoldMessenger.of(context).hideCurrentSnackBar();
     }
     setState(() => _controlsVisible = !_controlsVisible);
+    _syncVolumeKeyEnabled();
+  }
+
+  /// 点击区域九宫格分发：按点按位置取九宫格动作执行。
+  void _handleTapZone(Offset position, BoxConstraints constraints) {
+    final action = readerTapZoneActionAt(
+      zones: _preferences.tapZones,
+      dx: position.dx,
+      dy: position.dy,
+      width: constraints.maxWidth,
+      height: constraints.maxHeight,
+    );
+    switch (action) {
+      case ReaderTapZoneAction.none:
+        break;
+      case ReaderTapZoneAction.menu:
+        _toggleControls();
+      case ReaderTapZoneAction.prevPage:
+        _pauseListenFollow();
+        unawaited(_turnPage(-1));
+      case ReaderTapZoneAction.nextPage:
+        _pauseListenFollow();
+        unawaited(_turnPage(1));
+      case ReaderTapZoneAction.prevChapter:
+        unawaited(_prev(startAtEnd: true));
+      case ReaderTapZoneAction.nextChapter:
+        unawaited(_next());
+      case ReaderTapZoneAction.toc:
+        unawaited(_showDirectory());
+    }
   }
 
   void _previewPreferences(ReaderPreferences preferences) {
     _preferencesDirty = true;
     final fontChanged = preferences.fontPath != _preferences.fontPath;
+    final intervalChanged =
+        preferences.einkRefreshInterval != _preferences.einkRefreshInterval;
     setState(() {
       _preferences = preferences.normalized();
       if (_preferences.themePreset != ReaderThemePreset.dark) {
         _dayTheme = _preferences.themePreset;
       }
+      // 刷新间隔改变时清零计数，避免沿用旧阈值导致久不刷新或立刻刷新。
+      if (intervalChanged) _einkPageCounter = 0;
     });
     if (fontChanged) unawaited(_loadFont(preferences.fontPath));
   }
@@ -1796,7 +1939,7 @@ class _ReaderPageState extends State<ReaderPage> with WidgetsBindingObserver {
               children: [
                 ListTile(
                   leading: const Icon(Icons.headphones),
-                  title: const Text('番茄听书'),
+                  title: const Text('听书'),
                   subtitle: const Text('使用作品自带音频与音色'),
                   onTap: () => Navigator.pop(context, false),
                 ),
@@ -1986,6 +2129,13 @@ class _ReaderPageState extends State<ReaderPage> with WidgetsBindingObserver {
         body: _errorView(),
       );
     }
+    return MediaQuery(
+      data: readerMediaQueryWithCutoutInsets(MediaQuery.of(context)),
+      child: Builder(builder: _buildReader),
+    );
+  }
+
+  Widget _buildReader(BuildContext context) {
     final preset = _effectivePreset;
     final windowPadding = MediaQuery.paddingOf(context);
     final overlayStyle = preset.isDark
@@ -2011,7 +2161,8 @@ class _ReaderPageState extends State<ReaderPage> with WidgetsBindingObserver {
                 SafeArea(
                   child: Column(
                     children: [
-                      if (_preferences.showReadingInfo)
+                      if (_preferences.readingInfoMode ==
+                          ReaderInfoMode.detailed)
                         GestureDetector(
                           onTap: _toggleControls,
                           behavior: HitTestBehavior.opaque,
@@ -2059,6 +2210,9 @@ class _ReaderPageState extends State<ReaderPage> with WidgetsBindingObserver {
                           builder: (context, _) => ReaderStatusBar(
                             key: const ValueKey('reader-status-bar'),
                             preset: preset,
+                            compact:
+                                _preferences.readingInfoMode ==
+                                ReaderInfoMode.compact,
                             status: _deviceStatus,
                             progress: _chapterProgress(),
                             chapterIndex: _index,
@@ -2155,6 +2309,18 @@ class _ReaderPageState extends State<ReaderPage> with WidgetsBindingObserver {
                 ],
               ),
             ),
+            if (!_loading &&
+                _error == null &&
+                _ideas.total > 0 &&
+                _chapterEndParagraph() != null)
+              IconButton(
+                key: const ValueKey('reader-toolbar-chapter-comments'),
+                tooltip: '本章评论',
+                onPressed: () => unawaited(
+                  _showIdeas(focusParaIndex: _chapterEndParagraph()),
+                ),
+                icon: Icon(LucideIcons.message_circle, color: preset.textColor),
+              ),
             IconButton(
               tooltip: '收起阅读菜单',
               onPressed: _toggleControls,
@@ -2170,6 +2336,20 @@ class _ReaderPageState extends State<ReaderPage> with WidgetsBindingObserver {
   );
 
   Widget _buildContent(ReaderThemePreset preset, EdgeInsets windowPadding) {
+    final chapterTurn = _chapterTurnRequest;
+    if (_loading && chapterTurn != null) {
+      // Keep the outgoing page on screen while the neighbouring chapter loads,
+      // so the boundary slides instead of flashing the loading spinner.
+      return GestureDetector(
+        behavior: HitTestBehavior.translucent,
+        onTap: _toggleControls,
+        child: ReaderPageContent(
+          page: chapterTurn.page,
+          spec: chapterTurn.spec,
+          imageProviderFactory: widget.imageProviderFactory,
+        ),
+      );
+    }
     if (_loading || _error != null) {
       return GestureDetector(
         behavior: HitTestBehavior.translucent,
@@ -2199,15 +2379,8 @@ class _ReaderPageState extends State<ReaderPage> with WidgetsBindingObserver {
               _stopAutoTurn();
             } else if (_controlsVisible) {
               _toggleControls();
-            } else if (details.localPosition.dx < constraints.maxWidth / 3) {
-              _pauseListenFollow();
-              _turnPage(-1);
-            } else if (details.localPosition.dx >
-                constraints.maxWidth * 2 / 3) {
-              _pauseListenFollow();
-              _turnPage(1);
             } else {
-              _toggleControls();
+              _handleTapZone(details.localPosition, constraints);
             }
           },
           child: Stack(
@@ -2224,20 +2397,17 @@ class _ReaderPageState extends State<ReaderPage> with WidgetsBindingObserver {
                         onPageChanged: _onPageChanged,
                         onBoundary: _pageBoundary,
                         onDragStart: _hideControlsOnDrag,
-                        turnStyle: _preferences.pageTurnStyle,
+                        instantSwipe: _preferences.instantSwipeTurn,
+                        turnStyle: _preferences.instantSwipeTurn
+                            ? ReaderPageTurnStyle.none
+                            : _preferences.pageTurnStyle,
                         backgroundColor: preset.backgroundColor,
-                        endPage: _buildChapterEndPage(preset),
-                        startPage: _buildChapterStartPage(preset),
-                        autoAdvanceBoundary:
-                            _preferences.continuousReading,
-                        onBoundaryLanded: (direction) {
-                          // _pageIndex never reports boundary pages, so the book end
-                          // stops auto turn from here.
-                          if (direction > 0 &&
-                              _index == widget.chapters.length - 1) {
-                            _stopAutoTurn();
-                          }
-                        },
+                        endPage: _index == widget.chapters.length - 1
+                            ? _buildChapterEndPage(preset)
+                            : null,
+                        onBookEnd: _stopAutoTurn,
+                        chapterTurn: _chapterTurnRequest,
+                        onChapterTurnCompleted: _onChapterTurnCompleted,
                         imageProviderFactory: widget.imageProviderFactory,
                         onParagraphLongPress: (block, position) =>
                             unawaited(_onParagraphLongPress(block, position)),
@@ -2247,6 +2417,7 @@ class _ReaderPageState extends State<ReaderPage> with WidgetsBindingObserver {
                         selectionScope: scope,
                         selection: _selection,
                         rangeUnderlines: _rangeUnderlines,
+                        narrationRange: _narrationRange,
                       )
                     : _buildScrollContent(layout, scope),
               ),
@@ -2272,6 +2443,7 @@ class _ReaderPageState extends State<ReaderPage> with WidgetsBindingObserver {
         washColor: preset.selectionWashColor,
         handleColor: preset.selectionHandleColor,
         underlineColor: preset.selectionUnderlineColor,
+        narrationColor: preset.narrationHighlightColor,
       );
       _marksScopeLayout = layout;
     }
@@ -2451,9 +2623,8 @@ class _ReaderPageState extends State<ReaderPage> with WidgetsBindingObserver {
         selection.end == block.end;
   }
 
-  /// 章末页: shown as the trailing page of a finished chapter — the chapter's
-  /// comment entry (the ideas response's end bucket) plus the next-chapter
-  /// action, the official 章末章评 landing without its circle/ad modules.
+  /// The final chapter keeps a stable completion page. Other chapters go
+  /// directly to the next text page; their comments are in the reader toolbar.
   Widget _buildChapterEndPage(ReaderThemePreset preset) {
     final endBucket = _chapterEndParagraph();
     final commentCount = _ideas.total;
@@ -2475,30 +2646,11 @@ class _ReaderPageState extends State<ReaderPage> with WidgetsBindingObserver {
                     unawaited(_showIdeas(focusParaIndex: endBucket)),
                 child: Text('查看本章评论 · $commentCount'),
               ),
-            const SizedBox(height: 12),
-            if (_index < widget.chapters.length - 1)
-              FilledButton(
-                onPressed: () => unawaited(_next()),
-                child: const Text('下一章'),
-              ),
           ],
         ),
       ),
     );
   }
-
-  /// 章首页: landing page for flipping backwards past the first page.
-  Widget _buildChapterStartPage(ReaderThemePreset preset) => ColoredBox(
-    color: preset.backgroundColor,
-    child: Center(
-      child: _index > 0
-          ? FilledButton(
-              onPressed: () => unawaited(_prev(startAtEnd: true)),
-              child: const Text('上一章'),
-            )
-          : null,
-    ),
-  );
 
   /// The chapter-end aggregate bucket: the ideas response's greatest paragraph
   /// key (e.g. para 10000), which the official client opens for 章末章评.
@@ -2538,19 +2690,27 @@ class _ReaderPageState extends State<ReaderPage> with WidgetsBindingObserver {
         }
         if (notification is OverscrollNotification &&
             notification.dragDetails != null &&
-            // Trailing-edge overscroll only: dragging past the bottom.
-            // (Leading-edge overscroll is negative and must not advance.)
-            notification.overscroll > 0 &&
             _preferences.continuousReading &&
             !_changingChapter &&
-            !_loading &&
-            _index < widget.chapters.length - 1) {
-          // 连续阅读：滚动到底后继续往下拉，把下一章接上，不用点章末的
-          // 「下一章」按钮。章末按钮行仍在，点它一样能进下一章/看评论。
-          _scrollOverscroll += notification.overscroll;
-          if (_scrollOverscroll > 32) {
-            _scrollOverscroll = 0;
-            unawaited(_next());
+            !_loading) {
+          // 连续阅读：滚动到底后继续往下拉，把下一章接上；滚到顶后继续
+          // 往下拉，把上一章接上（落在上一章末尾）。章末按钮行仍在，
+          // 点它一样能进上一章/下一章。Overscroll 带符号：底部为正、
+          // 顶部为负；到不了的方向不累计，避免陈旧的累计量在反向时
+          // 提前触发。
+          final overscroll = notification.overscroll;
+          final canAdvance = _index < widget.chapters.length - 1;
+          final canRetreat = _index > 0;
+          if ((overscroll > 0 && canAdvance) ||
+              (overscroll < 0 && canRetreat)) {
+            _scrollOverscroll += overscroll;
+            if (_scrollOverscroll > 32) {
+              _scrollOverscroll = 0;
+              unawaited(_next());
+            } else if (_scrollOverscroll < -32) {
+              _scrollOverscroll = 0;
+              unawaited(_prev(startAtEnd: true));
+            }
           }
         }
         return false;
@@ -2586,6 +2746,7 @@ class _ReaderPageState extends State<ReaderPage> with WidgetsBindingObserver {
                 selectionScope: scope,
                 selection: _selection,
                 rangeUnderlines: _rangeUnderlines,
+                narrationRange: _narrationRange,
                 onParagraphLongPress: (block, position) =>
                     unawaited(_onParagraphLongPress(block, position)),
                 onParagraphLongPressMoveUpdate: _onParagraphLongPressMoveUpdate,
@@ -2664,7 +2825,7 @@ class _ReaderPageState extends State<ReaderPage> with WidgetsBindingObserver {
     final previewIndex = seekValue.round().clamp(0, widget.chapters.length - 1);
     return ReaderControls(
       key: const ValueKey('reader-controls'),
-      preferences: _preferences,
+      preferences: _displayPreferences,
       chapterIndex: previewIndex,
       chapterCount: widget.chapters.length,
       chapterTitle: widget.chapters[previewIndex].title,
